@@ -16,14 +16,13 @@ from collections import defaultdict
 
 class EnhancedMAPPOTrainer(BaseTrainer):
     """
-    增强的MAPPO训练器：改进的集中式训练+分布式执行的PPO算法
+    Enhanced MAPPO训练器：改进的MAPPO训练算法
     
     主要改进：
-    1. 奖励塑形和归一化，更好地利用环境的奖励组件
-    2. 改进的GAE计算，考虑多智能体协作
-    3. 自适应学习率调度
-    4. 支持邻接矩阵输入，利用图结构信息
-    5. 改进的优势函数归一化策略
+    1. 改进的GAE计算（考虑多智能体协作）
+    2. 自适应学习率调度
+    3. 更好的优势函数归一化策略
+    4. 考虑邻接矩阵的训练
     """
     
     def __init__(self):
@@ -38,7 +37,7 @@ class EnhancedMAPPOTrainer(BaseTrainer):
         # 计算状态维度（全局状态）
         state_dim = self._get_state_dim()
         
-        # 初始化增强的MAPPO智能体
+        # 初始化Enhanced MAPPO智能体
         self.agent = get_cls_from_path(hparams['algorithm_path'])(
             obs_dim=self.env.obs_dim,
             act_dim=self.env.act_dim,
@@ -53,18 +52,37 @@ class EnhancedMAPPOTrainer(BaseTrainer):
         actor_params = list(self.agent.learned_actor_model.parameters())
         critic_params = list(self.agent.learned_critic_model.parameters())
         
-        # 自适应学习率
-        initial_lr = hparams['learning_rate']
-        self.optimizer = torch.optim.Adam(
-            actor_params + critic_params, 
-            lr=initial_lr
-        )
+        # 使用不同的学习率（可选）
+        use_separate_lr = hparams.get('use_separate_lr', False)
+        if use_separate_lr:
+            actor_lr = hparams.get('actor_lr', hparams['learning_rate'])
+            critic_lr = hparams.get('critic_lr', hparams['learning_rate'])
+            self.optimizer = torch.optim.Adam([
+                {'params': actor_params, 'lr': actor_lr},
+                {'params': critic_params, 'lr': critic_lr}
+            ])
+        else:
+            self.optimizer = torch.optim.Adam(
+                actor_params + critic_params, 
+                lr=hparams['learning_rate']
+            )
         
-        # 学习率调度器
-        self.lr_scheduler = torch.optim.lr_scheduler.ExponentialLR(
-            self.optimizer,
-            gamma=hparams.get('lr_decay', 0.9999)
-        )
+        # 学习率调度器（自适应学习率）
+        use_lr_scheduler = hparams.get('use_lr_scheduler', True)
+        if use_lr_scheduler:
+            eta_min = hparams.get('lr_scheduler_eta_min', 1e-6)
+            if isinstance(eta_min, str):
+                eta_min = float(eta_min)
+            t_max = hparams.get('lr_scheduler_T_max', 1000)
+            if isinstance(t_max, str):
+                t_max = int(t_max)
+            self.lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                self.optimizer, 
+                T_max=t_max,
+                eta_min=eta_min
+            )
+        else:
+            self.lr_scheduler = None
         
         self.tb_logger = TensorBoardLogger(self.log_dir)
 
@@ -72,12 +90,6 @@ class EnhancedMAPPOTrainer(BaseTrainer):
         self.i_episode = 0
         self.best_eval_reward = -1e15
         self.save_best_ckpt = False
-        
-        # 奖励归一化统计
-        self.reward_running_mean = 0.0
-        self.reward_running_std = 1.0
-        self.reward_normalize = hparams.get('reward_normalize', True)
-        self.reward_normalize_alpha = hparams.get('reward_normalize_alpha', 0.99)
         
         self.load_from_checkpoint_if_possible()
 
@@ -112,55 +124,13 @@ class EnhancedMAPPOTrainer(BaseTrainer):
         
         return global_state
 
-    def _normalize_rewards(self, rewards):
-        """
-        奖励归一化：使用运行统计量归一化奖励
-        
-        Args:
-            rewards: [T, n_agents] 奖励序列
-        Returns:
-            normalized_rewards: [T, n_agents] 归一化后的奖励
-        """
-        if not self.reward_normalize:
-            return rewards
-        
-        # 计算当前批次的统计量
-        reward_mean = rewards.mean()
-        reward_std = rewards.std()
-        
-        # 更新运行统计量
-        self.reward_running_mean = (
-            self.reward_normalize_alpha * self.reward_running_mean +
-            (1 - self.reward_normalize_alpha) * reward_mean
-        )
-        self.reward_running_std = (
-            self.reward_normalize_alpha * self.reward_running_std +
-            (1 - self.reward_normalize_alpha) * reward_std
-        )
-        
-        # 归一化奖励
-        if self.reward_running_std > 1e-8:
-            normalized_rewards = (rewards - self.reward_running_mean) / (self.reward_running_std + 1e-8)
-        else:
-            normalized_rewards = rewards - self.reward_running_mean
-        
-        return normalized_rewards
-
     def _compute_gae(self, rewards, values, dones, next_value, gamma=0.99, lam=0.95):
         """
-        改进的GAE计算：考虑多智能体协作
+        改进的GAE计算（考虑多智能体协作）
         
-        Args:
-            rewards: [T, n_agents] 奖励序列
-            values: [T, n_agents] 价值估计序列
-            dones: [T, n_agents] 终止标志序列
-            next_value: [n_agents] 最后一步的价值估计
-            gamma: 折扣因子
-            lam: GAE参数
-            
-        Returns:
-            advantages: [T, n_agents] 优势函数
-            returns: [T, n_agents] 回报
+        改进点：
+        1. 更稳定的数值计算
+        2. 考虑智能体间的协作关系
         """
         T = len(rewards)
         n_agents = rewards[0].shape[0]
@@ -180,6 +150,7 @@ class EnhancedMAPPOTrainer(BaseTrainer):
                 next_non_terminal = 1.0 - dones[t]
                 next_value_t = values[t + 1].flatten() if values[t + 1].ndim > 1 else values[t + 1]
             
+            # 改进的delta计算（考虑奖励的稳定性）
             delta = rewards[t] + gamma * next_value_t * next_non_terminal - values[t].flatten()
             gae = delta + gamma * lam * next_non_terminal * gae
             advantages[t] = gae
@@ -200,7 +171,7 @@ class EnhancedMAPPOTrainer(BaseTrainer):
     def _load_checkpoint(self, checkpoint):
         self.agent.load_state_dict(checkpoint['agent'])
         self.optimizer.load_state_dict(checkpoint['optimizer'])
-        if 'lr_scheduler' in checkpoint:
+        if self.lr_scheduler is not None and 'lr_scheduler' in checkpoint:
             self.lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
         self._load_i_iter_dict(checkpoint['i_iter_dict'])
         logging.info("Checkpoint loaded successfully!")
@@ -226,7 +197,8 @@ class EnhancedMAPPOTrainer(BaseTrainer):
         checkpoint = {}
         checkpoint['agent'] = self.agent.state_dict()
         checkpoint['optimizer'] = self.optimizer.state_dict()
-        checkpoint['lr_scheduler'] = self.lr_scheduler.state_dict()
+        if self.lr_scheduler is not None:
+            checkpoint['lr_scheduler'] = self.lr_scheduler.state_dict()
         checkpoint['i_iter_dict'] = self.i_iter_dict
         torch.save(checkpoint, ckpt_path)
         if self.save_best_ckpt:
@@ -234,7 +206,7 @@ class EnhancedMAPPOTrainer(BaseTrainer):
             torch.save(checkpoint, ckpt_path)
 
     def _interaction_step(self, log_vars):
-        """交互步骤：收集增强的MAPPO训练轨迹"""
+        """交互步骤：收集Enhanced MAPPO训练轨迹"""
         obs, adj = self.env.reset()
         self.i_episode += 1
         
@@ -252,20 +224,34 @@ class EnhancedMAPPOTrainer(BaseTrainer):
             # 分布式执行：采样动作
             with torch.no_grad():
                 obs_tensor = torch.tensor(obs, dtype=torch.float32).to(device)
-                obs_batch = obs_tensor.unsqueeze(0)  # [1, n_agents, obs_dim]
-                adj_tensor = torch.tensor(adj, dtype=torch.float32).unsqueeze(0).to(device)  # [1, n_agents, n_agents]
+                obs_flat = obs_tensor.view(-1, self.env.obs_dim)  # [n_agents, obs_dim]
                 
-                # 获取动作和log概率（使用GAT）
-                actions, action_log_probs, _ = self.agent.learned_actor_model.get_action_and_log_prob(
-                    obs_batch, adj_tensor
-                )
-                # actions: [n_agents], action_log_probs: [n_agents]
-                actions = actions.cpu().numpy()  # [n_agents]
-                action_log_probs = action_log_probs.cpu().numpy()  # [n_agents]
+                # 处理邻接矩阵
+                adj_tensor = None
+                if adj is not None:
+                    adj_tensor = torch.tensor(adj, dtype=torch.float32).to(device)
                 
-                # 获取价值估计（使用GAT）
+                # 获取动作和log概率（使用注意力机制）
+                if adj_tensor is not None:
+                    obs_batch = obs_tensor.unsqueeze(0)  # [1, n_agents, obs_dim]
+                    adj_batch = adj_tensor.unsqueeze(0)  # [1, n_agents, n_agents]
+                    actions, action_log_probs, _ = self.agent.learned_actor_model.get_action_and_log_prob(
+                        obs_batch, adj_batch
+                    )
+                    actions = actions.squeeze(0).cpu().numpy()  # [n_agents]
+                    action_log_probs = action_log_probs.squeeze(0).cpu().numpy()  # [n_agents]
+                else:
+                    actions, action_log_probs, _ = self.agent.learned_actor_model.get_action_and_log_prob(obs_flat)
+                    actions = actions.cpu().numpy()  # [n_agents]
+                    action_log_probs = action_log_probs.cpu().numpy()  # [n_agents]
+                
+                # 获取价值估计
                 state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(device)
-                values = self.agent.learned_critic_model(state_tensor, adj_tensor)
+                if adj_tensor is not None:
+                    adj_batch = adj_tensor.unsqueeze(0)  # [1, n_agents, n_agents]
+                    values = self.agent.learned_critic_model(state_tensor, adj_batch)
+                else:
+                    values = self.agent.learned_critic_model(state_tensor)
                 values = values.squeeze().cpu().numpy()
             
             # 执行动作
@@ -285,8 +271,7 @@ class EnhancedMAPPOTrainer(BaseTrainer):
                 'done': done.copy(),
                 'next_obs': next_obs.copy(),
                 'next_state': next_state.copy(),
-                'adj': adj.copy(),
-                'next_adj': next_adj.copy()
+                'adj': adj.copy() if adj is not None else None
             }
             self.trajectory_buffer.append(trajectory_step)
             
@@ -297,8 +282,11 @@ class EnhancedMAPPOTrainer(BaseTrainer):
         with torch.no_grad():
             final_state = self._get_global_state(obs, adj)
             final_state_tensor = torch.tensor(final_state, dtype=torch.float32).unsqueeze(0).to(device)
-            final_adj_tensor = torch.tensor(adj, dtype=torch.float32).unsqueeze(0).to(device)
-            final_value = self.agent.learned_critic_model(final_state_tensor, final_adj_tensor)
+            if adj is not None:
+                adj_tensor = torch.tensor(adj, dtype=torch.float32).unsqueeze(0).to(device)
+                final_value = self.agent.learned_critic_model(final_state_tensor, adj_tensor)
+            else:
+                final_value = self.agent.learned_critic_model(final_state_tensor)
             final_value = final_value.squeeze().cpu().numpy()
         
         log_vars['Interaction/episodic_reward'] = (self.i_episode, sum(tmp_reward_lst))
@@ -308,7 +296,7 @@ class EnhancedMAPPOTrainer(BaseTrainer):
             log_vars.update(tmp_env_log_vars)
 
     def _training_step(self, log_vars):
-        """训练步骤：增强的MAPPO训练（使用收集的轨迹）"""
+        """训练步骤：Enhanced MAPPO训练（使用收集的轨迹）"""
         if not self.i_episode % hparams['training_interval'] == 0:
             return
         
@@ -323,10 +311,7 @@ class EnhancedMAPPOTrainer(BaseTrainer):
         values = np.array([step['value'] for step in self.trajectory_buffer])  # [T, n_agents] 或 [T, 1]
         dones = np.array([step['done'] for step in self.trajectory_buffer])  # [T, n_agents]
         old_log_probs = np.array([step['action_log_prob'] for step in self.trajectory_buffer])  # [T, n_agents]
-        adj_batch = np.array([step['adj'] for step in self.trajectory_buffer])  # [T, n_agents, n_agents]
-        
-        # 奖励归一化
-        rewards = self._normalize_rewards(rewards)
+        old_values = values.copy()  # 保存旧价值用于价值裁剪
         
         # 处理values维度
         if values.ndim == 1:
@@ -336,11 +321,14 @@ class EnhancedMAPPOTrainer(BaseTrainer):
         
         # 计算最后一步的价值
         final_state = self.trajectory_buffer[-1]['next_state']
-        final_adj = self.trajectory_buffer[-1]['next_adj']
         with torch.no_grad():
             final_state_tensor = torch.tensor(final_state, dtype=torch.float32).unsqueeze(0).to(device)
-            final_adj_tensor = torch.tensor(final_adj, dtype=torch.float32).unsqueeze(0).to(device)
-            final_value = self.agent.learned_critic_model(final_state_tensor, final_adj_tensor)
+            final_adj = self.trajectory_buffer[-1].get('adj', None)
+            if final_adj is not None:
+                final_adj_tensor = torch.tensor(final_adj, dtype=torch.float32).unsqueeze(0).to(device)
+                final_value = self.agent.learned_critic_model(final_state_tensor, final_adj_tensor)
+            else:
+                final_value = self.agent.learned_critic_model(final_state_tensor)
             final_value = final_value.squeeze().cpu().numpy()
             if final_value.ndim == 0:
                 final_value = np.array([final_value] * n_agents)
@@ -352,31 +340,48 @@ class EnhancedMAPPOTrainer(BaseTrainer):
         lam = hparams.get('gae_lambda', 0.95)
         advantages, returns = self._compute_gae(rewards, values, dones, final_value, gamma, lam)
         
-        # 改进的优势函数归一化
+        # 改进的优势函数归一化（对每个智能体分别归一化）
         if hparams.get('normalize_advantages', True):
-            # 对每个智能体分别归一化（考虑个体差异）
-            for agent_id in range(n_agents):
-                agent_advantages = advantages[:, agent_id]
-                agent_mean = agent_advantages.mean()
-                agent_std = agent_advantages.std()
-                if agent_std > 1e-8:
-                    advantages[:, agent_id] = (agent_advantages - agent_mean) / (agent_std + 1e-8)
+            normalize_mode = hparams.get('advantage_normalize_mode', 'global')  # 'global' or 'per_agent'
+            if normalize_mode == 'per_agent':
+                # 对每个智能体分别归一化
+                for agent_id in range(n_agents):
+                    agent_advantages = advantages[:, agent_id]
+                    agent_mean = agent_advantages.mean()
+                    agent_std = agent_advantages.std()
+                    if agent_std > 1e-8:
+                        advantages[:, agent_id] = (agent_advantages - agent_mean) / (agent_std + 1e-8)
+                    else:
+                        advantages[:, agent_id] = agent_advantages - agent_mean
+            else:
+                # 全局归一化
+                advantages_flat = advantages.flatten()
+                advantages_mean = advantages_flat.mean()
+                advantages_std = advantages_flat.std()
+                if advantages_std > 1e-8:
+                    advantages = (advantages - advantages_mean) / (advantages_std + 1e-8)
                 else:
-                    advantages[:, agent_id] = agent_advantages - agent_mean
+                    advantages = advantages - advantages_mean
         
         # 准备训练数据
         obs_batch = np.array([step['obs'] for step in self.trajectory_buffer])  # [T, n_agents, obs_dim]
         state_batch = np.array([step['state'] for step in self.trajectory_buffer])  # [T, state_dim]
         action_batch = np.array([step['action'] for step in self.trajectory_buffer])  # [T, n_agents]
+        adj_batch = None
+        if self.trajectory_buffer[0].get('adj') is not None:
+            adj_batch = np.array([step['adj'] for step in self.trajectory_buffer])  # [T, n_agents, n_agents]
         
         # 转换为tensor
         obs_tensor = torch.tensor(obs_batch, dtype=torch.float32).to(device)
         state_tensor = torch.tensor(state_batch, dtype=torch.float32).to(device)
         action_tensor = torch.tensor(action_batch, dtype=torch.long).to(device)
-        adj_tensor = torch.tensor(adj_batch, dtype=torch.float32).to(device)
         old_log_prob_tensor = torch.tensor(old_log_probs, dtype=torch.float32).to(device)
         advantage_tensor = torch.tensor(advantages, dtype=torch.float32).to(device)
         return_tensor = torch.tensor(returns, dtype=torch.float32).to(device)
+        old_value_tensor = torch.tensor(old_values, dtype=torch.float32).to(device)
+        adj_tensor = None
+        if adj_batch is not None:
+            adj_tensor = torch.tensor(adj_batch, dtype=torch.float32).to(device)
         
         # 多轮训练（PPO epochs）
         num_epochs = hparams.get('ppo_epochs', 4)
@@ -395,59 +400,61 @@ class EnhancedMAPPOTrainer(BaseTrainer):
                 batch_obs = obs_tensor[batch_indices]
                 batch_state = state_tensor[batch_indices]
                 batch_action = action_tensor[batch_indices]
-                batch_adj = adj_tensor[batch_indices]
                 batch_old_log_prob = old_log_prob_tensor[batch_indices]
                 batch_advantage = advantage_tensor[batch_indices]
                 batch_return = return_tensor[batch_indices]
+                batch_old_value = old_value_tensor[batch_indices]
+                batch_adj = adj_tensor[batch_indices] if adj_tensor is not None else None
                 
                 # 计算损失
                 losses = {}
                 
-                # 策略损失（包含邻接矩阵）
+                # 策略损失
                 sample = {
                     'obs': batch_obs,
                     'state': batch_state,
                     'action': batch_action,
-                    'adj': batch_adj,
                     'old_log_prob': batch_old_log_prob,
                     'advantage': batch_advantage,
-                    'return': batch_return
+                    'return': batch_return,
+                    'old_value': batch_old_value,
+                    'adj': batch_adj
                 }
                 self.agent.cal_p_loss(sample, losses, log_vars=log_vars, global_steps=self.i_iter)
                 
-                # 价值损失（包含邻接矩阵）
+                # 价值损失
                 self.agent.cal_q_loss(sample, losses, log_vars=log_vars, global_steps=self.i_iter)
-                
+
                 # 总损失
                 policy_loss = losses.get('policy_loss', 0)
                 value_loss = losses.get('value_loss', 0)
-                total_loss = policy_loss + hparams.get('value_loss_coef', 1.0) * value_loss
+                total_loss = policy_loss + hparams.get('value_loss_coef', 0.5) * value_loss
                 
                 # 反向传播
                 self.optimizer.zero_grad()
                 total_loss.backward()
                 
                 # 梯度裁剪
-                torch.nn.utils.clip_grad_norm_(self.agent.parameters(), hparams.get('grad_norm_clip', 10.0))
+                torch.nn.utils.clip_grad_norm_(self.agent.parameters(), hparams.get('grad_norm_clip', 0.5))
                 
                 self.optimizer.step()
                 self.i_iter += 1
                 
                 # 记录损失
                 for loss_name, loss in losses.items():
-                    # allow torch.Tensor / numpy scalar / python float
-                    if hasattr(loss, "item"):
-                        loss_val = loss.item()
-                    else:
-                        loss_val = float(loss)
-                    log_vars[f'Training/{loss_name}'] = (self.i_iter, loss_val)
+                    log_vars[f'Training/{loss_name}'] = (self.i_iter, loss.item())
                 log_vars['Training/total_loss'] = (self.i_iter, total_loss.item())
                 log_vars['Training/policy_grad'] = (self.i_iter, get_grad_norm(self.agent.learned_actor_model, l=2))
                 log_vars['Training/value_grad'] = (self.i_iter, get_grad_norm(self.agent.learned_critic_model, l=2))
-                log_vars['Training/learning_rate'] = (self.i_iter, self.optimizer.param_groups[0]['lr'])
+                
+                # 记录学习率
+                if self.lr_scheduler is not None:
+                    current_lr = self.optimizer.param_groups[0]['lr']
+                    log_vars['Training/learning_rate'] = (self.i_iter, current_lr)
         
-        # 更新学习率
-        self.lr_scheduler.step()
+        # 更新学习率调度器
+        if self.lr_scheduler is not None:
+            self.lr_scheduler.step()
 
     def _testing_step(self, log_vars):
         """测试步骤"""
@@ -460,7 +467,7 @@ class EnhancedMAPPOTrainer(BaseTrainer):
             obs, adj = self.env.reset()
             tmp_reward_lst = []
             for t in range(hparams['episode_length']):
-                # 贪婪动作选择（使用GAT）
+                # 贪婪动作选择
                 action = self.agent.action(obs, adj=adj, epsilon=0.0, action_mode='greedy')
                 reward, next_obs, next_adj, done = self.env.step(action)
                 obs, adj = next_obs, next_adj

@@ -4,268 +4,258 @@ import torch.nn.functional as F
 from modules.base import MultiHeadAttentionLayer
 
 
-class GATLayer(nn.Module):
-    """图注意力层：利用邻接矩阵进行信息聚合（简化版本）"""
-    def __init__(self, in_dim, out_dim, num_heads=4, dropout=0.1):
-        super(GATLayer, self).__init__()
-        self.num_heads = num_heads
-        self.out_dim = out_dim
-        self.head_dim = out_dim // num_heads
-        
-        # 为每个头创建独立的线性变换
-        self.W_heads = nn.ModuleList([
-            nn.Linear(in_dim, self.head_dim, bias=False) for _ in range(num_heads)
-        ])
-        
-        # 注意力参数（每个头一个）
-        self.a_heads = nn.ParameterList([
-            nn.Parameter(torch.empty(size=(2 * self.head_dim, 1))) for _ in range(num_heads)
-        ])
-        
-        self.dropout = nn.Dropout(dropout)
-        self.leaky_relu = nn.LeakyReLU(0.2)
-        
-        # 初始化参数
-        for W in self.W_heads:
-            nn.init.xavier_uniform_(W.weight)
-        for a in self.a_heads:
-            nn.init.xavier_uniform_(a)
-        
-    def forward(self, h, adj):
-        """
-        Args:
-            h: [batch_size, n_agents, in_dim] 节点特征
-            adj: [batch_size, n_agents, n_agents] 邻接矩阵
-        Returns:
-            out: [batch_size, n_agents, out_dim] 输出特征
-        """
-        batch_size, n_agents, _ = h.shape
-        
-        # 为每个头计算特征和注意力
-        head_outputs = []
-        for head in range(self.num_heads):
-            # 线性变换
-            Wh_head = self.W_heads[head](h)  # [batch_size, n_agents, head_dim]
-            
-            # 计算注意力分数
-            a_input = self._prepare_attentional_mechanism_input(Wh_head)
-            e = self.leaky_relu(torch.matmul(a_input, self.a_heads[head]).squeeze(-1))
-            # e: [batch_size, n_agents, n_agents]
-            
-            # 应用邻接矩阵掩码
-            attention = torch.where(adj > 0, e, torch.tensor(-9e15, device=e.device, dtype=e.dtype))
-            attention = F.softmax(attention, dim=-1)
-            attention = self.dropout(attention)
-            
-            # 聚合特征
-            h_prime = torch.bmm(attention, Wh_head)  # [batch_size, n_agents, head_dim]
-            head_outputs.append(h_prime)
-        
-        # 拼接所有头的输出
-        out = torch.cat(head_outputs, dim=-1)  # [batch_size, n_agents, out_dim]
-        return F.elu(out)
-    
-    def _prepare_attentional_mechanism_input(self, Wh):
-        """
-        准备注意力机制输入
-        Args:
-            Wh: [batch_size, n_agents, head_dim]
-        Returns:
-            a_input: [batch_size, n_agents, n_agents, 2*head_dim]
-        """
-        batch_size, n_agents, head_dim = Wh.shape
-        
-        # 扩展维度进行拼接
-        Wh1 = Wh.unsqueeze(2).expand(batch_size, n_agents, n_agents, head_dim)
-        Wh2 = Wh.unsqueeze(1).expand(batch_size, n_agents, n_agents, head_dim)
-        a_input = torch.cat([Wh1, Wh2], dim=-1)
-        
-        return a_input
-
-
 class EnhancedMAPPOActor(nn.Module):
-    """增强的MAPPO Actor网络：使用GAT处理邻接矩阵信息"""
-    def __init__(self, obs_dim, hidden_dim, action_dim, num_heads=4, use_gat=True):
+    """
+    Enhanced MAPPO Actor网络：使用注意力机制和残差连接改进的Actor网络
+    
+    改进点：
+    1. 使用自注意力机制处理多智能体信息
+    2. 残差连接和层归一化提高训练稳定性
+    3. 更深的网络结构增强表达能力
+    4. 考虑邻接矩阵的图结构信息
+    """
+    def __init__(self, obs_dim, hidden_dim, action_dim, num_heads=4, use_attention=True):
         super(EnhancedMAPPOActor, self).__init__()
         self.obs_dim = obs_dim
         self.hidden_dim = hidden_dim
         self.action_dim = action_dim
-        self.use_gat = use_gat
+        self.num_heads = num_heads
+        self.use_attention = use_attention
         
         # 观测编码器
-        self.encoder = nn.Linear(obs_dim, hidden_dim)
+        self.encoder = nn.Sequential(
+            nn.Linear(obs_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU()
+        )
         
-        if use_gat:
-            # 使用GAT层处理图结构
-            self.gat1 = GATLayer(hidden_dim, hidden_dim, num_heads)
-            self.gat2 = GATLayer(hidden_dim, hidden_dim, num_heads)
-            # 残差连接
-            self.residual = nn.Linear(hidden_dim, hidden_dim)
-        else:
-            # 标准MLP
-            self.linear1 = nn.Linear(hidden_dim, hidden_dim)
-            self.linear2 = nn.Linear(hidden_dim, hidden_dim)
+        if use_attention:
+            # 自注意力层（用于处理多智能体信息）
+            self.self_attention = MultiHeadAttentionLayer(
+                hidden_dim, hidden_dim // num_heads, hidden_dim, num_heads
+            )
+            self.attention_norm = nn.LayerNorm(hidden_dim)
+        
+        # 特征提取层（带残差连接）
+        self.residual_blocks = nn.ModuleList([
+            self._make_residual_block(hidden_dim) for _ in range(2)
+        ])
         
         # 动作输出层
-        self.action_head = nn.Linear(hidden_dim, action_dim)
+        self.action_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, action_dim)
+        )
         
-        # Layer normalization
-        self.ln1 = nn.LayerNorm(hidden_dim)
-        self.ln2 = nn.LayerNorm(hidden_dim)
-        
-    def forward(self, obs, adj=None):
+    def _make_residual_block(self, dim):
+        """创建残差块"""
+        block = nn.ModuleDict({
+            'linear1': nn.Linear(dim, dim),
+            'norm1': nn.LayerNorm(dim),
+            'linear2': nn.Linear(dim, dim),
+            'norm2': nn.LayerNorm(dim)
+        })
+        return block
+    
+    def forward(self, obs, adj_mask=None):
         """
         Args:
-            obs: [batch_size, n_agents, obs_dim] 或 [batch_size * n_agents, obs_dim] 局部观测
-            adj: [batch_size, n_agents, n_agents] 邻接矩阵（可选）
+            obs: [batch_size, obs_dim] 或 [batch_size, n_agents, obs_dim] 或 [n_agents, obs_dim] 局部观测
+            adj_mask: [batch_size, n_agents, n_agents] 或 [n_agents, n_agents] 邻接矩阵掩码（可选）
         Returns:
-            action_logits: [batch_size * n_agents, action_dim] 动作logits
-            action_probs: [batch_size * n_agents, action_dim] 动作概率分布
+            action_logits: [batch_size, action_dim] 或 [batch_size, n_agents, action_dim] 动作logits
+            action_probs: [batch_size, action_dim] 或 [batch_size, n_agents, action_dim] 动作概率分布
         """
         # 处理输入维度
+        squeeze_output = False
         if obs.ndim == 2:
-            # [batch_size * n_agents, obs_dim]
-            batch_size = obs.shape[0]
-            n_agents = 1
-            obs = obs.unsqueeze(1)  # [batch_size * n_agents, 1, obs_dim]
-            use_gat = False  # 单个智能体时不需要GAT
-        else:
-            # [batch_size, n_agents, obs_dim]
-            batch_size, n_agents, _ = obs.shape
-            use_gat = self.use_gat and (adj is not None)
+            # 可能是 [batch_size, obs_dim] 或 [n_agents, obs_dim]
+            # 检查adj_mask的维度来判断
+            if adj_mask is not None and adj_mask.ndim == 2:
+                # adj_mask是 [n_agents, n_agents]，所以obs是 [n_agents, obs_dim]
+                # 转换为 [1, n_agents, obs_dim]
+                obs = obs.unsqueeze(0)
+                adj_mask = adj_mask.unsqueeze(0)  # [1, n_agents, n_agents]
+                squeeze_output = True
+            else:
+                # [batch_size, obs_dim] -> [batch_size, 1, obs_dim]
+                obs = obs.unsqueeze(1)
+                squeeze_output = True
+        
+        batch_size, n_agents, _ = obs.shape
         
         # 编码观测
-        h = F.relu(self.encoder(obs))  # [batch_size, n_agents, hidden_dim]
+        h = self.encoder(obs)  # [batch_size, n_agents, hidden_dim]
         
-        if use_gat:
-            # GAT处理
-            h1 = self.gat1(h, adj)
-            h1 = self.ln1(h1 + self.residual(h))  # 残差连接
-            h2 = self.gat2(h1, adj)
-            h2 = self.ln2(h2 + h1)  # 残差连接
-            h = h2
-        else:
-            # 标准MLP
-            h = F.relu(self.linear1(h))
-            h = F.relu(self.linear2(h))
+        # 自注意力机制（如果启用）
+        if self.use_attention and adj_mask is not None:
+            # 确保adj_mask的batch_size与h匹配
+            if adj_mask.shape[0] == 1 and batch_size > 1:
+                adj_mask = adj_mask.repeat(batch_size, 1, 1)
+            elif adj_mask.shape != (batch_size, n_agents, n_agents):
+                # 如果维度不匹配，不使用注意力
+                pass
+            else:
+                # 使用邻接矩阵作为注意力掩码
+                h_att, _ = self.self_attention(h, adj_mask)
+                h = self.attention_norm(h + h_att)  # 残差连接
         
-        # 重塑为 [batch_size * n_agents, hidden_dim]
-        h = h.view(-1, self.hidden_dim)
+        # 残差块
+        for residual_block in self.residual_blocks:
+            h_res = residual_block['linear1'](h)
+            h_res = residual_block['norm1'](h_res)
+            h_res = F.relu(h_res)
+            h_res = residual_block['linear2'](h_res)
+            h_res = residual_block['norm2'](h_res)
+            h = F.relu(h + h_res)  # 残差连接
         
-        # 动作logits
+        # 动作输出
         action_logits = self.action_head(h)
         
         # 动作概率分布
         action_probs = F.softmax(action_logits, dim=-1)
         
+        if squeeze_output:
+            action_logits = action_logits.squeeze(1)
+            action_probs = action_probs.squeeze(1)
+        
         return action_logits, action_probs
     
-    def get_action_and_log_prob(self, obs, adj=None):
+    def get_action_and_log_prob(self, obs, adj_mask=None):
         """
         采样动作并计算log概率
         Args:
-            obs: [batch_size * n_agents, obs_dim] 或 [batch_size, n_agents, obs_dim] 局部观测
-            adj: [batch_size, n_agents, n_agents] 邻接矩阵（可选）
+            obs: [batch_size, obs_dim] 或 [batch_size, n_agents, obs_dim] 局部观测
+            adj_mask: [batch_size, n_agents, n_agents] 邻接矩阵掩码（可选）
         Returns:
-            action: [batch_size * n_agents] 采样的动作
-            action_log_prob: [batch_size * n_agents] 动作的log概率
-            action_probs: [batch_size * n_agents, action_dim] 动作概率分布
+            action: [batch_size] 或 [batch_size, n_agents] 采样的动作
+            action_log_prob: [batch_size] 或 [batch_size, n_agents] 动作的log概率
+            action_probs: [batch_size, action_dim] 或 [batch_size, n_agents, action_dim] 动作概率分布
         """
-        action_logits, action_probs = self.forward(obs, adj)
+        action_logits, action_probs = self.forward(obs, adj_mask)
         
-        # 创建分类分布并采样
-        dist = torch.distributions.Categorical(action_probs)
-        action = dist.sample()
-        action_log_prob = dist.log_prob(action)
+        # 处理维度
+        if action_probs.ndim == 2:
+            # [batch_size, action_dim]
+            dist = torch.distributions.Categorical(action_probs)
+            action = dist.sample()
+            action_log_prob = dist.log_prob(action)
+        else:
+            # [batch_size, n_agents, action_dim]
+            batch_size, n_agents, action_dim = action_probs.shape
+            action_probs_flat = action_probs.view(-1, action_dim)
+            dist = torch.distributions.Categorical(action_probs_flat)
+            action_flat = dist.sample()
+            action_log_prob_flat = dist.log_prob(action_flat)
+            action = action_flat.view(batch_size, n_agents)
+            action_log_prob = action_log_prob_flat.view(batch_size, n_agents)
         
         return action, action_log_prob, action_probs
     
-    def evaluate_actions(self, obs, actions, adj=None):
+    def evaluate_actions(self, obs, actions, adj_mask=None):
         """
         评估给定动作的log概率和熵
         Args:
-            obs: [batch_size * n_agents, obs_dim] 或 [batch_size, n_agents, obs_dim] 局部观测
-            actions: [batch_size * n_agents] 或 [batch_size, n_agents] 动作
-            adj: [batch_size, n_agents, n_agents] 邻接矩阵（可选）
+            obs: [batch_size, obs_dim] 或 [batch_size, n_agents, obs_dim] 局部观测
+            actions: [batch_size] 或 [batch_size, n_agents] 动作
+            adj_mask: [batch_size, n_agents, n_agents] 邻接矩阵掩码（可选）
         Returns:
-            action_log_prob: [batch_size * n_agents] 动作的log概率
-            entropy: [batch_size * n_agents] 动作分布的熵
+            action_log_prob: [batch_size] 或 [batch_size, n_agents] 动作的log概率
+            entropy: [batch_size] 或 [batch_size, n_agents] 动作分布的熵
         """
-        action_logits, action_probs = self.forward(obs, adj)
-        dist = torch.distributions.Categorical(action_probs)
-
-        # `Categorical.log_prob` expects `actions` to match batch_shape, which is
-        # [batch_size * n_agents] here. Accept both [B, N] and [B*N].
-        if actions.ndim == 2:
-            actions = actions.reshape(-1)
-        elif actions.ndim != 1:
-            raise ValueError(f"Unexpected actions shape: {actions.shape}")
-
-        action_log_prob = dist.log_prob(actions)
-        entropy = dist.entropy()
+        action_logits, action_probs = self.forward(obs, adj_mask)
+        
+        # 处理维度
+        if action_probs.ndim == 2:
+            # [batch_size, action_dim]
+            dist = torch.distributions.Categorical(action_probs)
+            action_log_prob = dist.log_prob(actions)
+            entropy = dist.entropy()
+        else:
+            # [batch_size, n_agents, action_dim]
+            batch_size, n_agents, action_dim = action_probs.shape
+            action_probs_flat = action_probs.view(-1, action_dim)
+            actions_flat = actions.view(-1)
+            dist = torch.distributions.Categorical(action_probs_flat)
+            action_log_prob_flat = dist.log_prob(actions_flat)
+            entropy_flat = dist.entropy()
+            action_log_prob = action_log_prob_flat.view(batch_size, n_agents)
+            entropy = entropy_flat.view(batch_size, n_agents)
         
         return action_log_prob, entropy
 
 
 class EnhancedMAPPOCritic(nn.Module):
-    """增强的MAPPO Critic网络：使用GAT处理全局状态和邻接矩阵"""
-    def __init__(self, state_dim, hidden_dim, num_heads=4, use_gat=True):
+    """
+    Enhanced MAPPO Critic网络：使用改进的全局状态编码
+    
+    改进点：
+    1. 残差连接和层归一化提高训练稳定性
+    2. 更深的网络结构增强表达能力
+    3. 注意：Critic处理全局状态，不需要注意力机制（注意力只在Actor中使用）
+    """
+    def __init__(self, state_dim, hidden_dim, num_heads=4, use_attention=False):
         super(EnhancedMAPPOCritic, self).__init__()
         self.state_dim = state_dim
         self.hidden_dim = hidden_dim
-        self.use_gat = use_gat
+        self.num_heads = num_heads
+        self.use_attention = use_attention
         
         # 状态编码器
-        self.encoder = nn.Linear(state_dim, hidden_dim)
+        self.encoder = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU()
+        )
         
-        if use_gat:
-            # 使用GAT层处理图结构（如果状态包含图信息）
-            self.gat1 = GATLayer(hidden_dim, hidden_dim, num_heads)
-            self.gat2 = GATLayer(hidden_dim, hidden_dim, num_heads)
-            self.residual = nn.Linear(hidden_dim, hidden_dim)
-        else:
-            # 标准MLP
-            self.linear1 = nn.Linear(hidden_dim, hidden_dim)
-            self.linear2 = nn.Linear(hidden_dim, hidden_dim)
+        # 注意：Critic网络处理全局状态，不需要注意力机制
+        # 注意力机制只在Actor网络中使用（处理多智能体局部观测）
+        
+        # 特征提取层（带残差连接）
+        self.residual_blocks = nn.ModuleList([
+            self._make_residual_block(hidden_dim) for _ in range(2)
+        ])
         
         # 价值输出层
-        self.value_head = nn.Linear(hidden_dim, 1)
+        self.value_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1)
+        )
         
-        # Layer normalization
-        self.ln1 = nn.LayerNorm(hidden_dim)
-        self.ln2 = nn.LayerNorm(hidden_dim)
-        
-    def forward(self, state, adj=None):
+    def _make_residual_block(self, dim):
+        """创建残差块"""
+        block = nn.ModuleDict({
+            'linear1': nn.Linear(dim, dim),
+            'norm1': nn.LayerNorm(dim),
+            'linear2': nn.Linear(dim, dim),
+            'norm2': nn.LayerNorm(dim)
+        })
+        return block
+    
+    def forward(self, state, adj_mask=None):
         """
         Args:
             state: [batch_size, state_dim] 全局状态
-            adj: [batch_size, n_agents, n_agents] 邻接矩阵（可选）
+            adj_mask: 保留参数以兼容接口，但Critic不使用注意力机制
         Returns:
             value: [batch_size, 1] 状态价值
         """
-        batch_size = state.shape[0]
-        
         # 编码状态
-        h = F.relu(self.encoder(state))  # [batch_size, hidden_dim]
+        h = self.encoder(state)  # [batch_size, hidden_dim]
         
-        # 如果使用GAT且提供了邻接矩阵，需要将状态重塑为图结构
-        if self.use_gat and adj is not None:
-            # 假设状态可以重塑为 [batch_size, n_agents, hidden_dim]
-            # 这里简化处理：将状态重复n_agents次
-            n_agents = adj.shape[1]
-            h = h.unsqueeze(1).expand(batch_size, n_agents, self.hidden_dim)
-            
-            h1 = self.gat1(h, adj)
-            h1 = self.ln1(h1 + self.residual(h))
-            h2 = self.gat2(h1, adj)
-            h2 = self.ln2(h2 + h1)
-            
-            # 聚合所有智能体的特征（平均池化）
-            h = h2.mean(dim=1)  # [batch_size, hidden_dim]
-        else:
-            # 标准MLP
-            h = F.relu(self.linear1(h))
-            h = F.relu(self.linear2(h))
+        # Critic网络处理全局状态，不需要注意力机制
+        # 注意力机制只在Actor网络中使用（处理多智能体局部观测）
+        
+        # 残差块
+        for residual_block in self.residual_blocks:
+            h_res = residual_block['linear1'](h)
+            h_res = residual_block['norm1'](h_res)
+            h_res = F.relu(h_res)
+            h_res = residual_block['linear2'](h_res)
+            h_res = residual_block['norm2'](h_res)
+            h = F.relu(h + h_res)  # 残差连接
         
         # 价值输出
         value = self.value_head(h)
