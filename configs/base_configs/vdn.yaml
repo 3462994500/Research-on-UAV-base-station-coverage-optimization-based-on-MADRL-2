@@ -1,0 +1,30 @@
+# the path of algorithm class
+algorithm_path: agents.vdn.VDNAgent
+trainer_path: trainers.vdn_trainer.VDNTrainer
+
+# Network Design
+hidden_dim: 128
+
+# DL & RL hyper-params
+learning_rate: 0.0005
+batch_size: 32
+buffer_capacity: 5000
+gamma: 0.99
+soft_update_target_network: true
+tau: 0.01
+target_update_interval: 200
+grad_norm_clip: 10.0
+
+# Training hyper-params
+training_action_mode: epsilon-greedy
+testing_action_mode: greedy
+num_max_keep_ckpt: 5
+
+# epsilon-greedy
+burnin_episode: 1000
+initial_epsilon: 1.0
+min_epsilon: 0.05
+epsilon_linear_decay: true
+epsilon_decay_percent_episode: 0.0001
+epsilon_exponential_decay: false
+epsilon_decay_temperature: 0.0001

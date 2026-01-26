@@ -1,3 +1,0 @@
-base_config:
-  - ./env.yaml
-  - configs/base_configs/drgn.yaml

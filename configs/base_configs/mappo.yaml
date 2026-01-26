@@ -1,0 +1,25 @@
+# the path of algorithm class
+algorithm_path: agents.mappo.MAPPOAgent
+trainer_path: trainers.mappo_trainer.MAPPOTrainer
+
+# Network Design
+hidden_dim: 128
+
+# DL & RL hyper-params
+learning_rate: 0.0001  # 降低学习率以提高稳定性（从0.0003降低到0.0001）
+batch_size: 32  # 减小批次大小，增加更新频率（从64降低到32）
+gamma: 0.99
+gae_lambda: 0.95  # GAE参数
+normalize_advantages: true  # 是否归一化优势函数
+value_loss_coef: 1.0  # 增加价值损失系数，提高Critic训练稳定性（从0.5增加到1.0）
+grad_norm_clip: 10.0  # 增加梯度裁剪阈值，防止梯度爆炸（从0.5增加到10.0）
+
+# PPO hyper-params
+clip_param: 0.2  # PPO裁剪参数（保持标准值）
+entropy_coef: 0.01  # 熵正则化系数（保持标准值）
+ppo_epochs: 2  # 减少PPO训练轮数，防止过拟合（从4降低到2）
+
+# Training hyper-params
+training_action_mode: sample  # MAPPO使用采样动作
+testing_action_mode: greedy  # 测试时使用贪婪动作
+num_max_keep_ckpt: 5

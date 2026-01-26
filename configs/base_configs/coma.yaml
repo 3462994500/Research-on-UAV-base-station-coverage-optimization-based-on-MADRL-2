@@ -1,0 +1,22 @@
+# the path of algorithm class
+algorithm_path: agents.coma.COMAAgent
+trainer_path: trainers.coma_trainer.COMATrainer
+
+# Network Design
+hidden_dim: 128
+
+# DL & RL hyper-params
+learning_rate: 0.0005
+batch_size: 64
+gamma: 0.99
+value_loss_coef: 0.5  # 价值损失系数
+grad_norm_clip: 0.5  # 梯度裁剪阈值
+
+# COMA hyper-params
+entropy_coef: 0.01  # 熵正则化系数
+coma_epochs: 1  # COMA训练轮数（on-policy通常为1）
+
+# Training hyper-params
+training_action_mode: sample  # COMA使用采样动作
+testing_action_mode: greedy  # 测试时使用贪婪动作
+num_max_keep_ckpt: 5

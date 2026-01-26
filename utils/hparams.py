@@ -28,9 +28,9 @@ def override_config(old_config: dict, new_config: dict):#合并字典
 def set_hparams(config='', exp_name='', hparams_str='', print_hparams=True, global_hparams=True):
     if config == '' and exp_name == '':
         parser = argparse.ArgumentParser(description='')
-        parser.add_argument('--config', type=str, default='configs/scenarios/continuous_mcs3D/hyperdrqn.yaml',
+        parser.add_argument('--config', type=str, default='configs/scenarios/continuous_mcs3D/emappo.yaml',
                             help='location of the data corpus')
-        parser.add_argument('--exp_name', type=str, default='3Dhyperdrqn', help='exp_name')
+        parser.add_argument('--exp_name', type=str, default='emappo', help='exp_name')
         parser.add_argument('--hparams', type=str, default='',
                             help='location of the data corpus')
         parser.add_argument('--display', action='store_true', help='display')
@@ -58,7 +58,7 @@ def set_hparams(config='', exp_name='', hparams_str='', print_hparams=True, glob
     def load_config(config_fn):  # deep first
         if not os.path.exists(config_fn):
             return {}
-        with open(config_fn) as f:
+        with open(config_fn, encoding='utf-8') as f:
             hparams_ = yaml.safe_load(f)
         loaded_config.add(config_fn)
         if 'base_config' in hparams_:
@@ -83,7 +83,7 @@ def set_hparams(config='', exp_name='', hparams_str='', print_hparams=True, glob
         args_work_dir = f'checkpoints/{args.exp_name}'
         ckpt_config_path = f'{args_work_dir}/config.yaml'
         if os.path.exists(ckpt_config_path):
-            with open(ckpt_config_path) as f:
+            with open(ckpt_config_path, encoding='utf-8') as f:
                 saved_hparams.update(yaml.safe_load(f))
     hparams_ = {}
     if args.config != '':
@@ -113,8 +113,8 @@ def set_hparams(config='', exp_name='', hparams_str='', print_hparams=True, glob
             subprocess.check_call(f'rm -rf {args_work_dir}', shell=True)
     if args_work_dir != '' and (not os.path.exists(ckpt_config_path) or args.reset):
         os.makedirs(hparams_['work_dir'], exist_ok=True)
-        with open(ckpt_config_path, 'w') as f:
-            yaml.safe_dump(hparams_, f)
+        with open(ckpt_config_path, 'w', encoding='utf-8') as f:
+            yaml.safe_dump(hparams_, f, allow_unicode=True)
 
     hparams_['exp_name'] = args.exp_name
     hparams_['display'] = args.display

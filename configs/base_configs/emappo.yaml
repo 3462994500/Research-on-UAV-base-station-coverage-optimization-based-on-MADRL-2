@@ -1,0 +1,34 @@
+# Enhanced MAPPO Configuration
+# the path of algorithm class
+algorithm_path: agents.emappo.EnhancedMAPPOAgent
+trainer_path: trainers.emappo_trainer.EnhancedMAPPOTrainer
+
+# Network Design
+hidden_dim: 128
+use_gat: true  # 是否使用图注意力网络
+num_heads: 4  # GAT注意力头数
+
+# DL & RL hyper-params
+learning_rate: 0.0001  # 初始学习率
+lr_decay: 0.9999  # 学习率衰减率
+batch_size: 32  # 批次大小
+gamma: 0.99  # 折扣因子
+gae_lambda: 0.95  # GAE参数
+normalize_advantages: true  # 是否归一化优势函数
+value_loss_coef: 1.0  # 价值损失系数
+grad_norm_clip: 10.0  # 梯度裁剪阈值
+
+# PPO hyper-params
+clip_param: 0.2  # PPO裁剪参数
+entropy_coef: 0.01  # 初始熵正则化系数
+entropy_coef_min: 0.001  # 最小熵系数
+entropy_coef_decay: 0.9995  # 熵系数衰减率
+
+# Reward normalization
+reward_normalize: true  # 是否归一化奖励
+reward_normalize_alpha: 0.99  # 奖励归一化平滑系数
+
+# Training hyper-params
+training_action_mode: sample  # 训练时使用采样动作
+testing_action_mode: greedy  # 测试时使用贪婪动作
+num_max_keep_ckpt: 5

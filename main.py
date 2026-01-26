@@ -6,6 +6,7 @@
 
 # from utils.class_utils import get_cls_from_path
 # from utils.device import device
+import os
 import logging
 # from utils.hparams import set_hparams, hparams
 from utils.class_utils import get_cls_from_path
@@ -20,8 +21,8 @@ if __name__ == '__main__':
 # # 1.训练
     logging.basicConfig(level=logging.INFO)
     from utils.hparams import set_hparams, hparams
-
     set_hparams()
+
     trainer = get_cls_from_path(hparams['trainer_path'])()
     trainer.run()
 
