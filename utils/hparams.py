@@ -28,9 +28,9 @@ def override_config(old_config: dict, new_config: dict):#合并字典
 def set_hparams(config='', exp_name='', hparams_str='', print_hparams=True, global_hparams=True):
     if config == '' and exp_name == '':
         parser = argparse.ArgumentParser(description='')
-        parser.add_argument('--config', type=str, default='configs/scenarios/continuous_mcs3D/emappo.yaml',
+        parser.add_argument('--config', type=str, default='configs/scenarios/continuous_mcs3D/mappo.yaml',
                             help='location of the data corpus')
-        parser.add_argument('--exp_name', type=str, default='emappo', help='exp_name')
+        parser.add_argument('--exp_name', type=str, default='mappo', help='exp_name')
         parser.add_argument('--hparams', type=str, default='',
                             help='location of the data corpus')
         parser.add_argument('--display', action='store_true', help='display')
