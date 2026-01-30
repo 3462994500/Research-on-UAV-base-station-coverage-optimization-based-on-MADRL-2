@@ -22,9 +22,9 @@ value_loss_coef: 1
 grad_norm_clip: 10.0
 
 # PPO hyper-params
-clip_param: 0.15
-entropy_coef: 0.01
-ppo_epochs: 5
+clip_param: 0.1
+entropy_coef: 0.005
+ppo_epochs: 4
 
 # Value function improvements
 use_huber_loss: False
@@ -32,26 +32,17 @@ value_clip_param: null
 
 # Learning rate scheduler
 use_lr_scheduler: True
-lr_scheduler_T_max: 2000
-lr_scheduler_eta_min: 1e-6
+lr_scheduler_T_max: 5000
+lr_scheduler_eta_min: 0.0000005
+
+# Dynamic learning rate decay (for stabilizing optimal policy)
+max_no_improvement: 5  # Maximum consecutive episodes without improvement before decay
+reward_improvement_threshold: 0.01  # Minimum improvement ratio to reset counter
+lr_decay_factor: 0.5  # Factor to multiply learning rate by when decaying
+min_learning_rate: 0.00000001  # Minimum learning rate to prevent too small values
+
 
 # Training hyper-params
 training_action_mode: sample
 testing_action_mode: greedy
 num_max_keep_ckpt: 5  # 最多保存的检查点数量
-
-# 1. 学习率相关调整
-# 减小初始学习率：当前学习率为0.0001，可尝试减小到0.00005或0.00002，使更新更平滑
-# 调整学习率调度器：当前使用余弦退火调度器，可增大lr_scheduler_T_max从1000到2000或3000，使学习率下降更缓慢
-# 2. PPO核心参数调整
-# 减小clip_param：当前为0.2，可尝试减小到0.1或0.15，使策略更新更保守，减少震荡
-# 增加ppo_epochs：当前为4，可尝试增加到5或6，使策略和价值函数更充分地拟合数据
-# 3. 价值函数稳定性调整
-# 启用Huber损失：将use_huber_loss设置为True，提高价值函数的鲁棒性，减少异常值影响
-# 启用价值裁剪：设置value_clip_param为0.2或0.3，限制价值函数的更新幅度
-# 4. GAE和优势函数调整
-# 增加gae_lambda：当前为0.95，可尝试增大到0.98，使优势函数计算更平滑
-# 调整优势函数归一化方式：当前使用全局归一化(global)，可尝试改为每个智能体独立归一化(per_agent)
-# 5. 梯度和批次调整
-# 增加批次大小：当前为32，可尝试增大到64或128，使更新更稳定
-# 减小梯度裁剪值：当前为10.0，可尝试减小到5.0，限制过大的梯度更新

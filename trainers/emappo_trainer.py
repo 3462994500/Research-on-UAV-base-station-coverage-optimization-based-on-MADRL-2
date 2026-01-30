@@ -91,6 +91,15 @@ class EnhancedMAPPOTrainer(BaseTrainer):
         self.best_eval_reward = -1e15
         self.save_best_ckpt = False
         
+        # 动态学习率衰减相关变量
+        self.recent_eval_rewards = []  # 存储最近的测试奖励
+        self.no_improvement_count = 0  # 连续没有改进的次数
+        self.current_lr_decay = 1.0  # 当前学习率衰减因子
+        self.max_no_improvement = int(hparams.get('max_no_improvement', 5))  # 最大连续没有改进的次数
+        self.reward_improvement_threshold = float(hparams.get('reward_improvement_threshold', 0.01))  # 奖励改进阈值
+        self.lr_decay_factor = float(hparams.get('lr_decay_factor', 0.5))  # 学习率衰减因子
+        self.min_learning_rate = float(hparams.get('min_learning_rate', 1e-8))  # 最小学习率
+        
         self.load_from_checkpoint_if_possible()
 
     def _get_state_dim(self):
@@ -174,6 +183,13 @@ class EnhancedMAPPOTrainer(BaseTrainer):
         if self.lr_scheduler is not None and 'lr_scheduler' in checkpoint:
             self.lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
         self._load_i_iter_dict(checkpoint['i_iter_dict'])
+        # 加载动态学习率衰减相关变量
+        if 'recent_eval_rewards' in checkpoint:
+            self.recent_eval_rewards = checkpoint['recent_eval_rewards']
+        if 'no_improvement_count' in checkpoint:
+            self.no_improvement_count = checkpoint['no_improvement_count']
+        if 'current_lr_decay' in checkpoint:
+            self.current_lr_decay = checkpoint['current_lr_decay']
         logging.info("Checkpoint loaded successfully!")
 
     def load_from_checkpoint_if_possible(self):
@@ -200,6 +216,10 @@ class EnhancedMAPPOTrainer(BaseTrainer):
         if self.lr_scheduler is not None:
             checkpoint['lr_scheduler'] = self.lr_scheduler.state_dict()
         checkpoint['i_iter_dict'] = self.i_iter_dict
+        # 保存动态学习率衰减相关变量
+        checkpoint['recent_eval_rewards'] = self.recent_eval_rewards
+        checkpoint['no_improvement_count'] = self.no_improvement_count
+        checkpoint['current_lr_decay'] = self.current_lr_decay
         torch.save(checkpoint, ckpt_path)
         if self.save_best_ckpt:
             ckpt_path = os.path.join(self.work_dir, f"model_ckpt_best.ckpt")
@@ -491,13 +511,56 @@ class EnhancedMAPPOTrainer(BaseTrainer):
         logging.info(
             f"Episode {self.i_episode} evaluation reward: mean {episodic_reward_mean},"
             f" std {episodic_reward_std}")
+        
+        # 动态学习率衰减逻辑
+        self.recent_eval_rewards.append(episodic_reward_mean)
+        if len(self.recent_eval_rewards) > self.max_no_improvement:
+            self.recent_eval_rewards.pop(0)
+        
         if episodic_reward_mean > self.best_eval_reward:
-            self.save_best_ckpt = True
-            logging.info(
-                f"Best evaluation reward update: {self.best_eval_reward} ==> {episodic_reward_mean}")
-            self.best_eval_reward = episodic_reward_mean
+            improvement_ratio = (episodic_reward_mean - self.best_eval_reward) / abs(self.best_eval_reward + 1e-10)
+            if improvement_ratio > self.reward_improvement_threshold:
+                # 奖励有足够的改进
+                self.save_best_ckpt = True
+                logging.info(
+                    f"Best evaluation reward update: {self.best_eval_reward} ==> {episodic_reward_mean}")
+                self.best_eval_reward = episodic_reward_mean
+                self.no_improvement_count = 0  # 重置没有改进的次数
+                self.current_lr_decay = 1.0  # 重置学习率衰减因子
+            else:
+                # 奖励改进不足
+                self.save_best_ckpt = False
+                self.no_improvement_count += 1
+                logging.info(
+                    f"Reward improvement ({improvement_ratio:.4f}) below threshold ({self.reward_improvement_threshold}), "
+                    f"no_improvement_count: {self.no_improvement_count}")
         else:
+            # 奖励没有改进
             self.save_best_ckpt = False
+            self.no_improvement_count += 1
+            logging.info(
+                f"No reward improvement, no_improvement_count: {self.no_improvement_count}")
+        
+        # 如果连续没有改进的次数超过阈值，降低学习率
+        if self.no_improvement_count >= self.max_no_improvement:
+            # 计算新的学习率衰减因子
+            self.current_lr_decay *= self.lr_decay_factor
+            
+            # 更新所有参数组的学习率
+            for param_group in self.optimizer.param_groups:
+                # 获取当前参数组的学习率
+                current_lr = param_group['lr']
+                # 计算新的学习率
+                new_lr = max(current_lr * self.lr_decay_factor, self.min_learning_rate)
+                param_group['lr'] = new_lr
+                
+            logging.info(
+                f"Too many epochs without improvement, reducing learning rate by factor {self.lr_decay_factor}. "
+                f"New learning rate: {self.optimizer.param_groups[0]['lr']}")
+            
+            # 重置没有改进的次数
+            self.no_improvement_count = 0
+        
         self.save_checkpoint()
 
     def run(self):
